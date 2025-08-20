@@ -100,7 +100,7 @@ jobs:
       - name: build-rootfs
         shell: bash
         run: |
-          sudo buildrootfs -p minimal
+          sudo buildrootfs minimal
 
       # 7. 在 rootfs 内安装额外包 + 清理缓存
       - name: install-extra-packages-and-clean
