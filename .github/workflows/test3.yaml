@@ -1,0 +1,240 @@
+name: Manjaro-ARM64-XFCE-VNC
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '30 1 * * 1'
+
+concurrency:
+  group: ${{ github.repository }}-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - id: time
+        uses: boredland/get-time-action@2.0.0
+        with:
+          format: 'YYYYMMDD'
+      - name: install-build-dependencies
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            gdisk zip systemd-container bmap-tools \
+            asciidoc libarchive-tools git \
+            build-essential cmake libarchive-dev \
+            pkg-config libcurl4-openssl-dev \
+            libgpgme-dev libssl-dev fakeroot \
+            dh-autoreconf qemu-utils \
+            qemu-efi-aarch64 qemu-system-arm \
+            qemu-user-static
+          sudo pip3 install meson ninja
+      - name: install-pacman
+        shell: bash
+        env:
+          PACMAN_VERSION: 6.0.2
+        run: |
+          sudo git clone --depth 1 \
+            https://gitlab.manjaro.org/packages/core/pacman.git
+          pushd pacman
+          sudo wget -q \
+            https://sources.archlinux.org/other/pacman/pacman-${PACMAN_VERSION}.tar.xz
+          sudo tar -xf pacman-${PACMAN_VERSION}.tar.xz
+          pushd pacman-${PACMAN_VERSION}
+          sudo meson setup build \
+            --prefix=/usr --buildtype=plain \
+            -Ddoc=disabled -Ddoxygen=enabled \
+            -Dscriptlet-shell=/usr/bin/bash \
+            -Dldconfig=/usr/bin/ldconfig
+          sudo meson compile -C build
+          sudo meson install -C build
+          popd
+          sudo install -m644 pacman.conf /etc/pacman.conf
+          sudo install -m644 makepkg.conf /etc/
+          sudo mkdir -p /etc/pacman.d
+          sudo touch /etc/pacman.d/mirrorlist
+          popd
+      - name: setup-qemu-binfmt
+        shell: bash
+        run: |
+          sudo wget -q \
+            https://gitlab.manjaro.org/manjaro-arm/packages/manjaro-arm-qemu-static/-/raw/master/qemu-static.conf \
+            -O /usr/lib/binfmt.d/qemu-static.conf
+          sudo systemctl restart systemd-binfmt
+      - name: install-arch-install-scripts
+        shell: bash
+        env:
+          VERSION: 28
+        run: |
+          sudo wget -q \
+            https://github.com/archlinux/arch-install-scripts/archive/refs/tags/v${VERSION}.tar.gz \
+            -O arch-install-scripts.tar.gz
+          sudo tar -xf arch-install-scripts.tar.gz
+          sudo make -C arch-install-scripts-${VERSION}
+          sudo make -C arch-install-scripts-${VERSION} check
+          sudo make -C arch-install-scripts-${VERSION} PREFIX=/usr install
+      - name: install-manjaro-arm-tools
+        shell: bash
+        run: |
+          sudo git clone --depth 1 \
+            https://gitlab.manjaro.org/manjaro-arm/applications/manjaro-arm-tools.git
+          install_m_a_tools() {
+            pkgname=manjaro-arm-tools
+            sudo install -dm755 /usr/share/$pkgname/{lib,profiles}
+            sudo install -d /etc/$pkgname
+            sudo install -dm755 /var/{lib,cache}/$pkgname/{pkg,img,tmp,profiles}
+            sudo install -dm755 /var/cache/$pkgname/{pkg/pkg-cache,img}
+            sudo install -Dm755 $pkgname/lib/* /usr/share/$pkgname/lib/
+            sudo install -Dm755 $pkgname/bin/* /usr/bin/
+            sudo install -Dm755 $pkgname/lib/manjaro-arm-tools.conf /etc/manjaro-arm-tools/
+          }
+          install_m_a_tools
+          sudo sed -i -e 's|1>/dev/null||g' \
+            /usr/share/manjaro-arm-tools/lib/functions.sh
+          sudo sed -i -e 's|1> /dev/null 2>&1||g' \
+            /usr/share/manjaro-arm-tools/lib/functions.sh
+          sudo sed -i -e 's|2>/dev/null||g' \
+            /usr/share/manjaro-arm-tools/lib/functions.sh
+      - name: build-rootfs
+        shell: bash
+        run: |
+          sudo buildrootfs minimal
+      - name: customize-rootfs
+        shell: bash
+        run: |
+          set -e
+          ROOTFS_TAR=$(find /var/cache/manjaro-arm-tools/img -name '*.tar.gz' | head -n1)
+          ROOTFS_DIR=/tmp/rootfs
+          echo "Using rootfs: $ROOTFS_TAR"
+          sudo mkdir -p "$ROOTFS_DIR"
+          sudo tar -xzf "$ROOTFS_TAR" -C "$ROOTFS_DIR"
+          sudo cp /usr/bin/qemu-aarch64-static "$ROOTFS_DIR/usr/bin/"
+          EXTRA_PKGS="
+            sudo nano vim systemd ca-certificates ca-certificates-utils sed gzip tar xz
+            util-linux fakeroot gcc clang cmake make
+            xorg-server xorg-xinit xorg-xrandr xorg-xsetroot xf86-video-fbdev
+            xfce4 xfce4-goodies lightdm lightdm-gtk-greeter lightdm-gtk-greeter-settings
+            xvfb x11vnc glmark2 mesa-demos glxgears screen
+            gvfs pavucontrol pulseaudio dbus-x11
+            noto-fonts noto-fonts-cjk ttf-dejavu
+          "
+          sudo systemd-nspawn -D "$ROOTFS_DIR" --bind-ro=/etc/resolv.conf -- /bin/bash -c "
+            set -e
+            pacman-key --init
+            pacman-key --populate archlinuxarm manjaro
+            pacman -Syu --noconfirm
+            pacman -S --needed --noconfirm $EXTRA_PKGS
+            ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
+            echo 'Asia/Shanghai' > /etc/timezone
+            VNC_PASS=\$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 12)
+            mkdir -p /etc/x11vnc
+            x11vnc -storepasswd \"\$VNC_PASS\" /etc/x11vnc/passwd
+            chmod 600 /etc/x11vnc/passwd
+            echo \"VNC_PASSWORD=\$VNC_PASS\" >> /etc/environment
+            echo \"=== VNC 随机密码 ===\" >&2
+            echo \"\$VNC_PASS\" >&2
+            # vncctl 脚本
+            cat >/usr/local/bin/vncctl <<'EOF_VNC'
+#!/bin/bash
+DISPLAY_NUM=":0"
+SCREEN_GEOM="1920x1080x24"
+VNC_PORT="5900"
+PASSWD_FILE="/etc/x11vnc/passwd"
+gen_pass() { tr -dc 'A-Za-z0-9' </dev/urandom | head -c 12; }
+write_pass() {
+    local pw=$1
+    mkdir -p "$(dirname "$PASSWD_FILE")"
+    x11vnc -storepasswd "$pw" "$PASSWD_FILE" >/dev/null 2>&1
+    chmod 600 "$PASSWD_FILE"
+    echo "$pw" | tee /etc/vnc_password
+    echo "新 VNC 密码：$pw"
+}
+start_vnc() {
+    pgrep -f "x11vnc.*$DISPLAY_NUM" >/dev/null && { echo "VNC 已运行"; return 0; }
+    [[ -f /etc/vnc_password ]] || write_pass "$(gen_pass)"
+    echo "启动 VNC 会话 ..."
+    env -i \
+        PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+        DISPLAY=$DISPLAY_NUM \
+        HOME=/root \
+        USER=root \
+        SHELL=/bin/bash \
+        bash -c 'set -e; \
+                 Xvfb $DISPLAY_NUM -screen 0 $SCREEN_GEOM -ac +extension GLX +render -noreset >/var/log/xvfb.log 2>&1 & \
+                 XVFB_PID=$!; sleep 2; \
+                 eval $(dbus-launch --sh-syntax --exit-with-session); \
+                 export DBUS_SESSION_BUS_ADDRESS DBUS_SESSION_BUS_PID; \
+                 startxfce4 >/var/log/xfce.log 2>&1 & \
+                 XFCE_PID=$!; \
+                 x11vnc -display $DISPLAY_NUM -forever -shared -noxdamage -xkb -rfbport $VNC_PORT \
+                        -passwdfile $PASSWD_FILE -logfile /var/log/x11vnc.log -bg & \
+                 VNC_PID=$!; \
+                 wait $XVFB_PID $XFCE_PID $VNC_PID'
+    echo "VNC 已启动 (DISPLAY=$DISPLAY_NUM)"
+}
+stop_vnc() {
+    pkill -f "x11vnc.*$DISPLAY_NUM"; pkill -f "startxfce4"; pkill -f "Xvfb.*$DISPLAY_NUM"
+    echo "VNC 已停止"
+}
+restart_vnc() { stop_vnc; sleep 1; start_vnc; }
+status_vnc() {
+    pgrep -f "x11vnc.*$DISPLAY_NUM" >/dev/null \
+        && echo "状态：运行中  密码：$(cat /etc/vnc_password 2>/dev/null || echo '未设置')" \
+        || echo "状态：未运行"
+}
+case "$1" in
+    start)   start_vnc ;;
+    stop)    stop_vnc ;;
+    restart) restart_vnc ;;
+    status)  status_vnc ;;
+    passwd)  write_pass "$(gen_pass)" ;;
+    *) echo "用法: $0 {start|stop|restart|status|passwd}" ;;
+esac
+EOF_VNC
+            chmod +x /usr/local/bin/vncctl
+            # systemd 单元：vnc.service
+            cat >/etc/systemd/system/vnc.service <<'EOF_VNC_SERVICE'
+[Unit]
+Description=VNC (XFCE+Xvfb+x11vnc)
+After=network.target
+
+[Service]
+Type=forking
+ExecStart=/usr/local/bin/vncctl start
+ExecStop=/usr/local/bin/vncctl stop
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+EOF_VNC_SERVICE
+            systemctl enable lightdm vnc
+            # 方案A：systemd-firstboot 一行搞定
+            systemctl enable systemd-firstboot.service
+            systemd-firstboot --prompt-root-password --prompt-user --user=manjaro --force
+
+            # 清理缓存
+            pacman -Scc --noconfirm
+          # proot 启动脚本（可选）
+          cat > "$ROOTFS_DIR/start-proot-systemd.sh" <<'EOF'
+#!/bin/bash
+export container="proot"
+export SYSTEMD_IGNORE_CHROOT=1
+exec /usr/lib/systemd/systemd --system --unit=multi-user.target
+EOF
+          chmod +x "$ROOTFS_DIR/start-proot-systemd.sh"
+
+          # 清理
+          sudo rm -rf "$ROOTFS_DIR/var/cache/pacman/pkg"/*
+          sudo find "$ROOTFS_DIR/etc/pacman.d/gnupg" -type s -delete 2>/dev/null || true
+          sudo tar -czf "$ROOTFS_TAR" -C "$ROOTFS_DIR" .
+      - name: upload-release
+        uses: softprops/action-gh-release@v0.1.15
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ steps.time.outputs.time }}
+          name: ${{ steps.time.outputs.time }}
+          draft: false
+          prerelease: false
+          files: |
+            /var/cache/manjaro-arm-tools/img/*.tar.gz
