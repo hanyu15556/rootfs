@@ -127,7 +127,7 @@ jobs:
             # 上海时区
             ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
             echo 'Asia/Shanghai' > /etc/timezone
-            hwclock --systohc
+            
 
             # 启用 supervisor
             systemctl enable supervisord
