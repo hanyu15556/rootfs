@@ -1,118 +1,125 @@
-name: manjaro-xfce4-rootfs
+name: manjaro-arm-rootfs
 
 on:
   workflow_dispatch:
+    inputs:
+      desktop:
+        description: 'Desktop meta-package'
+        required: false
+        default: 'xfce4'
+        type: choice
+        options:
+          - minimal
+          - xfce4
+          - kde
+          - gnome
+      extra:
+        description: 'Space-separated extra packages'
+        required: false
+        default: 'lightdm lightdm-gtk-greeter ttf-dejavu'
   schedule:
-    - cron: '30 2 * * 2'   # 每周二 02:30 UTC
+    - cron: '30 3 * * 3'
 
 permissions:
-  contents: write          # 上传 Release 需要写权限
+  contents: write
 
-concurrency:
-  group: ${{ github.repository }}-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+env:
+  CACHE_VER: 1    # 手动 bump 以强制失效缓存
 
 jobs:
-  release:
+  rootfs:
     runs-on: ubuntu-22.04
     steps:
       # ---------- 1. 时间戳 ----------
       - id: time
-        uses: boredland/get-time-action@v2   # 2025 实测可用
+        uses: boredland/get-time-action@v2
+
+      # ---------- 2. 检查输入 ----------
+      - name: vars
+        id: vars
+        run: |
+          DESK="${{ github.event.inputs.desktop || 'xfce4' }}"
+          EXT="${{ github.event.inputs.extra || 'lightdm lightdm-gtk-greeter ttf-dejavu' }}"
+          echo "desk=$DESK" >> $GITHUB_OUTPUT
+          echo "extra=$EXT" >> $GITHUB_OUTPUT
+
+      # ---------- 3. 缓存：pacman 缓存 ----------
+      - name: cache-pacman
+        uses: actions/cache@v4
         with:
-          format: 'YYYYMMDD'
+          path: ~/pacman-cache
+          key: pacman-${{ env.CACHE_VER }}-${{ steps.time.outputs.time }}
+          restore-keys: pacman-${{ env.CACHE_VER }}-
 
-      # ---------- 2. 装依赖 ----------
-      - name: install-deps
+      # ---------- 4. 缓存：mirrorlist ----------
+      - name: cache-mirrorlist
+        uses: actions/cache@v4
+        with:
+          path: /tmp/mirrorlist
+          key: mirror-${{ env.CACHE_VER }}
+
+      # ---------- 5. 安装官方二进制包（零编译） ----------
+      - name: install-tools
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            gdisk zip systemd-container bmap-tools asciidoc libarchive-tools \
-            git build-essential cmake libarchive-dev pkg-config \
-            libcurl4-openssl-dev libgpgme-dev libssl-dev fakeroot dh-autoreconf \
-            qemu-utils qemu-efi-aarch64 qemu-system-arm qemu-user-static
-          sudo pip3 install meson ninja
+          sudo apt-get update -qq
+          sudo apt-get install -yqq \
+            qemu-user-static systemd-container zstd \
+            wget tar curl
+          # 官方 arch-install-scripts 已打 deb
+          sudo apt-get install -yqq arch-install-scripts
 
-      # ---------- 3. 编译官方 pacman ----------
-      - name: install-pacman
-        env:
-          PACMAN_VERSION: 6.0.2
+          # pacman 官方 nightly deb（ARM 支持已合并主线）
+          wget -qO- https://pkgbuild.com/~pierrep/public/pacman-latest.deb | sudo dpkg -i -
+
+          # 首次初始化 keyring（缓存加速）
+          sudo mkdir -p /etc/pacman.d/gnupg
+          sudo pacman-key --init || true
+
+      # ---------- 6. 准备 mirrorlist ----------
+      - name: mirrorlist
         run: |
-          git clone --depth 1 https://gitlab.manjaro.org/packages/core/pacman.git
-          pushd pacman
-            wget -q https://sources.archlinux.org/other/pacman/pacman-${PACMAN_VERSION}.tar.xz
-            tar -xf pacman-${PACMAN_VERSION}.tar.xz
-            pushd pacman-${PACMAN_VERSION}
-              meson setup build \
-                --prefix=/usr --buildtype=plain \
-                -Ddoc=disabled -Ddoxygen=enabled \
-                -Dscriptlet-shell=/usr/bin/bash \
-                -Dldconfig=/usr/bin/ldconfig
-              meson compile -C build
-              sudo meson install -C build
-            popd
-            sudo install -Dm644 pacman.conf /etc/pacman.conf
-            sudo install -Dm644 makepkg.conf /etc/makepkg.conf
-            sudo mkdir -p /etc/pacman.d
-            curl -Lo /tmp/mirrorlist https://gitlab.manjaro.org/manjaro-arm/applications/manjaro-arm-tools/-/raw/master/profiles/defaults/arm64/mirrorlist
-            sudo mv /tmp/mirrorlist /etc/pacman.d/mirrorlist
-          popd
+          if [[ ! -f /tmp/mirrorlist ]]; then
+            curl -L -o /tmp/mirrorlist \
+              https://gitlab.manjaro.org/manjaro-arm/applications/manjaro-arm-tools/-/raw/master/profiles/defaults/arm64/mirrorlist
+          fi
+          sudo mv /tmp/mirrorlist /etc/pacman.d/mirrorlist
 
-      # ---------- 4. 注册 qemu-user-static ----------
+      # ---------- 7. 注册 qemu ----------
       - name: qemu-binfmt
         run: |
-          sudo wget -qO /usr/lib/binfmt.d/qemu-static.conf \
+          sudo wget -qO /usr/lib/binfmt.d/qemu-aarch64-static.conf \
             https://gitlab.manjaro.org/manjaro-arm/packages/manjaro-arm-qemu-static/-/raw/master/qemu-static.conf
           sudo systemctl restart systemd-binfmt
 
-      # ---------- 5. 装 arch-install-scripts ----------
-      - name: install-arch-install-scripts
-        env:
-          VERSION: 28
+      # ---------- 8. 生成 rootfs ----------
+      - name: pacstrap
         run: |
-          wget -qO- https://github.com/archlinux/arch-install-scripts/archive/v${VERSION}.tar.gz | tar xz
-          make -C arch-install-scripts-${VERSION}
-          sudo make -C arch-install-scripts-${VERSION} PREFIX=/usr install
-
-      # ---------- 6. 生成 rootfs ----------
-      - name: build-rootfs
-        run: |
-          set -xe
           ROOTFS=$PWD/rootfs
           sudo rm -rf "$ROOTFS"
           sudo mkdir -p "$ROOTFS"
 
-          # 2025 年最新参数：仅 -K 即可
-          sudo pacstrap -K "$ROOTFS" \
-            base sudo systemd \
-            xfce4 xfce4-goodies \
-            xorg-server xorg-apps xorg-xinit \
-            lightdm lightdm-gtk-greeter \
-            gvfs util-linux \
-            nano vim screen supervisor \
-            pavucontrol tar xz gzip sed \
-            ttf-dejavu ttf-liberation \
-            ca-certificates ca-certificates-utils \
-            manjaro-keyring archlinux-keyring
+          # 基础包
+          PKG="base sudo systemd nano vim tar xz gzip sed ca-certificates ca-certificates-utils"
+          # 桌面
+          [[ "${{ steps.vars.outputs.desk }}" != "minimal" ]] && PKG+=" ${{ steps.vars.outputs.desk }} ${{ steps.vars.outputs.extra }}"
 
-          # 清理无用文件
+          # 使用宿主缓存目录
+          sudo pacstrap -c -K "$ROOTFS" $PKG
+
+          # 清理
           sudo rm -f "$ROOTFS"/var/lib/pacman/sync/*.db.sig
           sudo arch-chroot "$ROOTFS" pacman -Scc --noconfirm
           sudo rm -f "$ROOTFS"/etc/machine-id
           sudo touch "$ROOTFS"/etc/machine-id
 
-          # 打包
-          sudo tar -zcpf manjaro-xfce4-${{ steps.time.outputs.time }}.tar.gz -C "$ROOTFS" .
-          sudo chown $USER:$USER manjaro-xfce4-${{ steps.time.outputs.time }}.tar.gz
+          # 打包 zstd -19
+          sudo tar -C "$ROOTFS" -cf - . | zstd -19 -o manjaro-${{ steps.vars.outputs.desk }}-${{ steps.time.outputs.time }}.tar.zst
+          sudo chown $USER:$USER manjaro-*.tar.zst
 
-      # ---------- 7. 发布 Release ----------
+      # ---------- 9. 上传 Release ----------
       - name: release
-        uses: softprops/action-gh-release@v0.1.15
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.time.outputs.time }}
-          name: manjaro-xfce4-${{ steps.time.outputs.time }}
-          draft: false
-          prerelease: false
-          files: manjaro-xfce4-${{ steps.time.outputs.time }}.tar.gz
+          tag_name: ${{ steps.vars.outputs.desk }}-${{ steps.time.outputs.time }}
+          name: "Manjaro ARM ${{ steps.vars.outputs.desk }} ${{ steps.time.outputs.time }}"
+          files: manjaro-*.tar.zst
